@@ -68,9 +68,9 @@ def parse_license_detail(html: str) -> dict:
 
     overview = ""
     text = _strip_html(html)
-    m = re.search(r"生产经营场所地址：(.*?)(?:排污许可证正本|$)", text)
+    m = re.search(r"生产经营场所地址[:：]\s*([\s\S]*?)(?=行业类别|所在地区|排污许可证正本|$)", text)
     if m:
-        overview = m.group(1).strip("| ")
+        overview = re.sub(r"[\xa0\s]+", " ", m.group(1)).strip()
 
     # 隐藏字段：经纬度
     def hidden_val(hid: str) -> str | None:
@@ -94,14 +94,21 @@ def parse_license_detail(html: str) -> dict:
                     })
             break
 
-    # 副本摘要
+    # 副本摘要（表格结构：每个字段一行 <th>字段名：</th><td>值</td>）
     summary = {}
-    for label in ["主要污染物类别", "大气主要污染物种类", "大气污染物排放规律",
-                  "大气污染物排放执行标准", "废水主要污染物种类", "废水污染物排放规律",
-                  "废水污染物排放执行标准", "排污权使用和交易信息"]:
-        m = re.search(re.escape(label) + r"[:：]\s*(.*?)(?:\|)", text)
-        if m:
-            summary[label] = m.group(1).strip()
+    for table in soup.find_all("table"):
+        header = [th.get_text(strip=True) for th in table.find_all("th")]
+        if "主要污染物类别" in "".join(header):
+            for tr in table.find_all("tr"):
+                th = tr.find("th")
+                td = tr.find("td")
+                if th is None or td is None:
+                    continue
+                key = th.get_text(strip=True).rstrip("：:")
+                val = td.get_text(strip=True)
+                if key:
+                    summary[key] = val
+            break
 
     # 排放口点位（AES 解密）
     points = decrypt_point_data(html)
