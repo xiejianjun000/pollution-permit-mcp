@@ -35,29 +35,29 @@ def register_tools(mcp: FastMCP) -> None:
     # ---------- 1. 许可信息公开查询 ----------
     @mcp.tool()
     def search_licenses(
-        province: str = "",
-        city: str = "",
         registerentername: str = "",
         xkznum: str = "",
         management: str = "",
-        treadname: str = "",
         page: int = 1,
     ) -> str:
-        """按省/市/企业名/许可证编号/管理类型/行业分页查询全国排污许可证（公开端，无需登录）。
+        """按企业名/许可证编号/管理类别分页查询全国排污许可证（公开端，无需登录）。
 
-        Args:
-            province: 省份，如"河北省"（留空表示全国）
-            city: 地市
-            registerentername: 企业名称关键字（登记企业名称）
-            xkznum: 排污许可证编号（如 91110108MA001XXXXX001V）
-            management: 管理类型（重点管理 / 简化管理）
-            treadname: 行业名称关键字
-            page: 页码，从 1 开始
+        实测平台参数能力边界（2026-08-30 验证）：
+        - registerentername：企业名称关键字（子串匹配）✅ 生效，如 "湖南" 命中 484 页
+        - xkznum：排污许可证编号（精确匹配）✅ 生效
+        - management：管理类别，仅接受代码 "1"=重点管理 / "0"=简化管理（传中文无效）✅ 生效
+        - page：页码，从 1 开始 ✅ 生效
+
+        ⚠️ 平台已失效/不支持的参数（勿用）：province、city、treadname（行业）。
+        这些参数后端静默忽略或返回空，已被移除。省/市/行业过滤请改用
+        registerentername（企业名含地名）间接实现。
         """
+        # 管理类别：兼容中文映射到平台代码（1=重点 / 0=简化）
+        _mgmt_map = {"重点管理": "1", "简化管理": "0", "重点": "1", "简化": "0"}
+        mgmt = _mgmt_map.get(management, management)
         data = {
-            "province": province, "city": city,
             "registerentername": registerentername, "xkznum": xkznum,
-            "management": management, "treadname": treadname,
+            "management": mgmt,
             "page.pageNo": page,
             "tempReportKey": c.get_temp_report_key(),
         }
