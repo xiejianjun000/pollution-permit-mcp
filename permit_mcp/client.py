@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -138,6 +139,20 @@ class PermitClient:
 
     def post(self, url: str, data: dict | None = None, use_cache: bool = True) -> str:
         return self.request("POST", url, data=data, use_cache=use_cache)
+
+    def get_temp_report_key(self) -> str:
+        """访问搜索列表页，提取隐藏字段 tempReportKey（分页搜索会话 token）。
+
+        平台搜索页会生成一个 32 位 hex 的 tempReportKey，POST 搜索需带上，
+        否则部分场景（尤其分页）可能被拒。提取失败返回空串（接口对缺省有容错）。
+        """
+        try:
+            self._ensure_ready()
+            html = self.get(config.URL_LICENSE_LIST, use_cache=False)
+            m = re.search(r'name="tempReportKey"\s+value="([^"]+)"', html)
+            return m.group(1) if m else ""
+        except Exception:  # noqa: BLE001
+            return ""
 
     def download(self, url: str, params: dict | None = None) -> bytes:
         """下载二进制文件（不缓存）。"""
