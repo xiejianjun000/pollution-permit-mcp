@@ -37,25 +37,29 @@ def register_tools(mcp: FastMCP) -> None:
     def search_licenses(
         province: str = "",
         city: str = "",
-        unit_name: str = "",
-        license_no: str = "",
-        industry: str = "",
+        registerentername: str = "",
+        xkznum: str = "",
+        management: str = "",
+        treadname: str = "",
         page: int = 1,
     ) -> str:
-        """按省/市/单位名/许可证编号/行业分页查询全国排污许可证（公开端，无需登录）。
+        """按省/市/企业名/许可证编号/管理类型/行业分页查询全国排污许可证（公开端，无需登录）。
 
         Args:
             province: 省份，如"河北省"（留空表示全国）
             city: 地市
-            unit_name: 企业名称关键字
-            license_no: 排污许可证编号（如 91110108MA001XXXXX001V）
-            industry: 行业类别
+            registerentername: 企业名称关键字（登记企业名称）
+            xkznum: 排污许可证编号（如 91110108MA001XXXXX001V）
+            management: 管理类型（重点管理 / 简化管理）
+            treadname: 行业名称关键字
             page: 页码，从 1 开始
         """
         data = {
-            "province": province, "city": city, "unitName": unit_name,
-            "licenseNumber": license_no, "industry": industry,
-            "pageIndex": page, "pageSize": 20,
+            "province": province, "city": city,
+            "registerentername": registerentername, "xkznum": xkznum,
+            "management": management, "treadname": treadname,
+            "page.pageNo": page,
+            "tempReportKey": c.get_temp_report_key(),
         }
         html = c.post(config.URL_LICENSE_LIST, data=data)
         return _out(parse_license_list(html))
