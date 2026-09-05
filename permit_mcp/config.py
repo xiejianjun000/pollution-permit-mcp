@@ -52,10 +52,23 @@ DEFAULT_HEADERS = {
                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9",
+    # /perxxgkinfo/ 应用校验来源页：必须声明从公开端首页点入。
+    # 缺失 Referer 时列表页会 302 到 errorinfo.jsp（平台反爬拦截）。
+    "Referer": BASE_URL + "/permitExt/defaults/default-index!getInformation.action",
 }
-REQUEST_INTERVAL = 1.0      # 秒，相邻请求最小间隔（合规限速）
+# 平台反爬错误页特征：HTTP 仍返回 200，但正文是 errorinfo.jsp 提示。
+# 未识别会导致解析层静默返回 count=0，调用方无法区分"确无匹配"与"被拦截"。
+BLOCK_PAGE_MARKERS = ("errorinfo.jsp", "请您访问", "点击许可信息公开查询")
+REQUEST_INTERVAL = 3.0      # 秒，相邻请求最小间隔（合规限速，2026-09-04 上调以缓解出口 IP 风控）
 RETRY_TIMES = 3             # 失败重试次数
 RETRY_BACKOFF = 2.0         # 重试退避基数（秒）
-TIMEOUT = 20                # 单请求超时
+# 单请求超时。原值 20s 偏紧：2026-09-02 实测平台高峰期首页即需 10–12s，
+# 列表页偶发超过 20s，导致正常请求被误判为失败。放宽到 45s。
+# 注意：超时与"平台拦截"是两回事，超时时应重试或稍后再试，不要当作 IP 被封。
+TIMEOUT = 45                # 单请求超时
 CACHE_TTL = 3600            # 缓存默认有效期（秒），1 小时
 CACHE_DB = "permit_cache.db"
+# 翻页结果磁盘缓存目录：按 (url+params) hash 存 JSON 文件，TTL 复用 CACHE_TTL
+PAGE_CACHE_DIR = "/opt/pollution-permit-mcp/work/cache"
+# 命中反爬页/超时后的指数退避基数：第 n 次重试等待 2^n * RISK_RETRY_BACKOFF 秒
+RISK_RETRY_BACKOFF = 3.0

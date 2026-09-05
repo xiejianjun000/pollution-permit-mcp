@@ -34,7 +34,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 1. 许可信息公开查询 ----------
     @mcp.tool()
-    def search_licenses(
+    def permit_pub_search_licenses(
         registerentername: str = "",
         xkznum: str = "",
         management: str = "",
@@ -55,18 +55,19 @@ def register_tools(mcp: FastMCP) -> None:
         # 管理类别：兼容中文映射到平台代码（1=重点 / 0=简化）
         _mgmt_map = {"重点管理": "1", "简化管理": "0", "重点": "1", "简化": "0"}
         mgmt = _mgmt_map.get(management, management)
-        data = {
+        filters = {
             "registerentername": registerentername, "xkznum": xkznum,
             "management": mgmt,
-            "page.pageNo": page,
-            "tempReportKey": c.get_temp_report_key(),
         }
-        html = c.post(config.URL_LICENSE_LIST, data=data)
-        return _out(parse_license_list(html))
+        # 链式翻页：平台 tempReportKey 每页变化，翻页需链式传递（否则退回第 1 页）
+        html, _, cache_hit = c.search_licenses_paged(filters, page)
+        result = parse_license_list(html)
+        result["cache"] = cache_hit
+        return _out(result)
 
     # ---------- 2. 许可证详情 ----------
     @mcp.tool()
-    def get_license_detail(dataid: str) -> str:
+    def permit_pub_license_detail(dataid: str) -> str:
         """获取企业排污许可证详情：基本信息、许可证正本版本、副本摘要、经纬度、排放口点位。
 
         Args:
@@ -77,7 +78,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 3. 副本图片页列表 ----------
     @mcp.tool()
-    def get_license_pages(dataid: str) -> str:
+    def permit_pub_license_pages(dataid: str) -> str:
         """获取排污许可证副本图片清单（页数与每页 datafileid），供 OCR 还原全文。
 
         Args:
@@ -97,7 +98,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 4. 副本页图片下载 ----------
     @mcp.tool()
-    def download_license_page(dataid: str, datafileid: str, output_path: str) -> str:
+    def permit_pub_download_page(dataid: str, datafileid: str, output_path: str) -> str:
         """下载排污许可证副本指定页 PNG 到本地，供 OCR。
 
         Args:
@@ -114,7 +115,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 5. 排放口二维码 ----------
     @mcp.tool()
-    def get_qrcode_info(dataid: str) -> str:
+    def permit_pub_qrcode_info(dataid: str) -> str:
         """生成排放口二维码（平台二维码接口，内容为许可证详情地址）。
 
         Args:
@@ -125,7 +126,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 6. 证后管理状态 ----------
     @mcp.tool()
-    def get_post_permit_status(dataid: str) -> str:
+    def permit_pub_post_permit_status(dataid: str) -> str:
         """获取证后管理实时情况：执行报告（年度/季度报告文档链接）、自行监测入口。
 
         Args:
@@ -157,7 +158,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 7. 限期整改 ----------
     @mcp.tool()
-    def get_rectification(province: str = "", unit_name: str = "", page: int = 1) -> str:
+    def permit_pub_rectification_list(province: str = "", unit_name: str = "", page: int = 1) -> str:
         """查询限期整改公示列表。
 
         Args:
@@ -171,7 +172,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 8. 公告（注销/撤销/遗失） ----------
     @mcp.tool()
-    def get_announcements(announce_type: str = "注销", page: int = 1) -> str:
+    def permit_pub_announcements(announce_type: str = "注销", page: int = 1) -> str:
         """查询排污许可证公告：注销、撤销、遗失声明。
 
         Args:
@@ -191,7 +192,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 9. 政策法规列表 ----------
     @mcp.tool()
-    def list_policy_docs(category: str = "Law", page: int = 1) -> str:
+    def permit_pub_policy_docs(category: str = "Law", page: int = 1) -> str:
         """按分类列出环保政策法规/标准目录。
 
         Args:
@@ -205,7 +206,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 10. 政策法规全文 ----------
     @mcp.tool()
-    def get_policy_detail(pkid: str) -> str:
+    def permit_pub_policy_detail(pkid: str) -> str:
         """获取政策法规/新闻/公告全文（明文正文 + 附件下载链接）。
 
         Args:
@@ -216,7 +217,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 11. 排放口点位解密（辅助） ----------
     @mcp.tool()
-    def get_discharge_points(dataid: str) -> str:
+    def permit_pub_discharge_points(dataid: str) -> str:
         """解密并返回企业排放口经纬度点位坐标数组（AES-128-ECB，密钥来自详情页内联脚本）。
 
         Args:
@@ -228,7 +229,7 @@ def register_tools(mcp: FastMCP) -> None:
 
     # ---------- 12. 证后管理监控接口（对接 wryjc 平台） ----------
     @mcp.tool()
-    def get_monitoring_data(dataid: str) -> str:
+    def permit_pub_monitoring_entry(dataid: str) -> str:
         """返回企业自行监测信息对接地址（全国污染源监测信息管理共享平台）。
 
         Args:
