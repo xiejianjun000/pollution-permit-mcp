@@ -59,10 +59,14 @@ def register_tools(mcp: FastMCP) -> None:
             "registerentername": registerentername, "xkznum": xkznum,
             "management": mgmt,
         }
-        # 链式翻页：平台 tempReportKey 每页变化，翻页需链式传递（否则退回第 1 页）
-        html, _, cache_hit = c.search_licenses_paged(filters, page)
-        result = parse_license_list(html)
-        result["cache"] = cache_hit
+        # 翻页优先级：本地索引 > 翻页缓存 > 回源上游（深翻页根治；来源见 result.source）
+        payload, _, source = c.search_licenses_paged(filters, page)
+        if source == "local_db":
+            result = payload
+        else:
+            result = parse_license_list(payload)
+        result["cache"] = (source != "upstream")
+        result["source"] = source
         return _out(result)
 
     # ---------- 2. 许可证详情 ----------

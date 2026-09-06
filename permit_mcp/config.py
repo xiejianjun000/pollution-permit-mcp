@@ -70,5 +70,7 @@ CACHE_TTL = 3600            # 缓存默认有效期（秒），1 小时
 CACHE_DB = "permit_cache.db"
 # 翻页结果磁盘缓存目录：按 (url+params) hash 存 JSON 文件，TTL 复用 CACHE_TTL
 PAGE_CACHE_DIR = "/opt/pollution-permit-mcp/work/cache"
+# 翻页磁盘缓存有效期：7 天。深翻页预热一次后长期命中，避免期满回源 50s 超时。
+PAGE_CACHE_TTL = 7 * 24 * 3600
 # 命中反爬页/超时后的指数退避基数：第 n 次重试等待 2^n * RISK_RETRY_BACKOFF 秒
 RISK_RETRY_BACKOFF = 3.0

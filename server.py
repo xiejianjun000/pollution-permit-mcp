@@ -22,6 +22,86 @@ from fastmcp import FastMCP
 from permit_mcp import config
 from permit_mcp.tools import register_tools
 
+# ===== P0.A1 统一错误返回（跨服务横切改造；错误返回函数由本改造独占）=====
+import json as _p0a1_json
+import asyncio as _p0a1_asyncio
+
+try:
+    from mcp.types import CallToolResult as _p0a1_CTR, TextContent as _p0a1_TC
+except Exception:  # pragma: no cover
+    _p0a1_CTR = None
+    _p0a1_TC = None
+
+_P0A1_BLOCKED_HINTS = ("webshield", "验证", "风控", "反爬", "captcha", "人机验证", "403", "blocked", "访问验证")
+
+
+def _p0a1_classify(err):
+    """异常分类为统一错误码；detail 仅保留安全上下文（参数名），绝不暴露堆栈。"""
+    tname = type(err).__name__
+    msg = str(err)
+    low = msg.lower()
+    if isinstance(err, _p0a1_asyncio.TimeoutError) or "timeout" in low or "timed out" in low or "超时" in msg:
+        return "UPSTREAM_TIMEOUT", "上游请求超时，请稍后重试", None
+    if any(h in msg for h in _P0A1_BLOCKED_HINTS):
+        return "UPSTREAM_BLOCKED", "上游返回反爬/风控验证页，请求被拦截", None
+    _not_found = ("unknown tool", "not found", "找不到", "does not exist", "未知工具")
+    if any(k in low for k in _not_found):
+        return "INVALID_PARAM", "参数校验失败：缺少或非法参数（或未知工具）", None
+    _val_hints = ("validation error", "input should", "input was invalid", "field required",
+                  "required", "missing", "must be", "expected", "should be a valid",
+                  "invalid", "参数", "类型", "provide")
+    if any(k in low for k in _val_hints):
+        return "INVALID_PARAM", "参数校验失败：缺少或非法参数", None
+    if tname in ("ValidationError", "ValueError", "TypeError", "MissingArgumentsError",
+                 "NotFoundError", "InvalidParams", "FastMCPError", "ToolError"):
+        detail = None
+        errs = getattr(err, "errors", None)
+        if callable(errs):
+            try:
+                detail = [".".join(str(p) for p in e.get("loc", [])) for e in errs() if e.get("loc")]
+            except Exception:
+                detail = None
+        if tname in ("FastMCPError", "ToolError") and not detail:
+            if any(k in low for k in _not_found):
+                return "INVALID_PARAM", "参数校验失败：缺少或非法参数（或未知工具）", None
+            return "INTERNAL", "服务内部错误，请联系管理员", None
+        return "INVALID_PARAM", "参数校验失败：缺少或非法参数", detail
+    return "INTERNAL", "服务内部错误，请联系管理员", None
+
+
+def _p0a1_err_json(code, message, detail=None):
+    payload = {"code": code, "message": message}
+    if detail is not None:
+        payload["detail"] = detail
+    return _p0a1_json.dumps(payload, ensure_ascii=False)
+
+
+def _p0a1_install_error_guard(mcp):
+    """包裹 mcp._tool_manager.call_tool，统一错误返回 {code,message,detail}。"""
+    tm = getattr(mcp, "_tool_manager", None)
+    if tm is None or not hasattr(tm, "call_tool"):
+        return False
+    _orig = tm.call_tool
+
+    async def _guarded(*args, **kwargs):
+        try:
+            return await _orig(*args, **kwargs)
+        except Exception as _e:
+            code, message, detail = _p0a1_classify(_e)
+            payload = {"code": code, "message": message}
+            if detail is not None:
+                payload["detail"] = detail
+            text = _p0a1_json.dumps(payload, ensure_ascii=False)
+            if _p0a1_CTR is not None and _p0a1_TC is not None:
+                return _p0a1_CTR(isError=True, content=[_p0a1_TC(type="text", text=text)])
+            return {"isError": True, "content": [{"type": "text", "text": text}]}
+
+    try:
+        tm.call_tool = _guarded
+    except Exception:
+        return False
+    return True
+
 
 def create_server() -> FastMCP:
     mcp = FastMCP(
@@ -43,6 +123,7 @@ def create_server() -> FastMCP:
         ),
     )
     register_tools(mcp)
+    _p0a1_install_error_guard(mcp)
     return mcp
 
 

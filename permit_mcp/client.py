@@ -14,6 +14,11 @@ from typing import Any, Optional
 import requests
 
 from . import config
+from .parser import parse_license_list
+
+# 本地全量索引库（build_license_db.py 后台持续灌入；深翻页优先读此库）
+LICENSE_DB = "/opt/pollution-permit-mcp/work/licenses.db"
+
 
 
 class RiskControlError(RuntimeError):
@@ -130,6 +135,7 @@ class PermitClient:
         self.cache: Cache | None = Cache(cache_db) if use_cache else None
         self.page_cache: JsonFileCache | None = JsonFileCache(page_cache_dir) if use_cache else None
         self._ready = False
+        self._chain = None  # 增量链式翻页状态：{filters, page, key}
 
     # ---- 会话预热 ----
     def _ensure_ready(self) -> None:
@@ -240,33 +246,181 @@ class PermitClient:
         except Exception:  # noqa: BLE001
             return ""
 
-    def search_licenses_paged(self, filters: dict, page: int) -> tuple[str, str, bool]:
-        """链式翻页查询许可证列表，返回 (HTML, 下一页 tempReportKey, 是否命中缓存)。
+    @staticmethod
+    def _extract_key(html: str) -> str:
+        m = re.search(r'name="tempReportKey"\s+value="([^"]+)"', html)
+        return m.group(1) if m else ""
 
-        平台分页 token（tempReportKey）是链式的：每次 POST 返回的新 token 才能用于下一页，
-        用旧 token 翻页会退回第 1 页。本方法正确维护链式 token。
+    def _search_local(self, filters: dict, page: int):
+        """本地索引优先：关键字 / 许可证号 / 管理类别查询若本地库已覆盖该页，直接返回（≤5s，不触上游）。
 
-        翻页结果按 (filters, page) 落盘缓存（key 不含链式 tempReportKey，保证稳定）：
-        风控期再次翻到已抓取过的页码时直接命中缓存，不再打上游。
+        支持 registerentername（子串）、xkznum（精确）、management（1=重点 / 0=简化）
+        任意组合。深翻页根治路径——命中本地库即 ≤5s 返回，绝不回源逐页重走。
+        全量无过滤（三者皆空）仍回源上游维护更准（数据过大，本地不全）。
+        若本地库尚未覆盖到所请求的页（建库进行中 / 该管理类别尚未爬全），返回 None 让调用方回源上游。
         """
-        cache_params = dict(filters)
-        cache_params["page.pageNo"] = page
-        if self.page_cache:
-            cached = self.page_cache.get(config.URL_LICENSE_LIST, cache_params)
-            if cached is not None:
-                return cached, "", True
+        kw = (filters.get("registerentername") or "").strip()
+        xkz = (filters.get("xkznum") or "").strip()
+        mgmt = (filters.get("management") or "").strip()
+        if not kw and not xkz and mgmt not in ("1", "0"):
+            return None
+        size = 15
+        off = (page - 1) * size
+        clauses = []
+        args = []
+        if kw:
+            like = f"%{kw}%"
+            clauses.append("(company_name LIKE ? OR license_no LIKE ? OR city LIKE ? OR province LIKE ?)")
+            args += [like, like, like, like]
+        if xkz:
+            clauses.append("license_no = ?")
+            args.append(xkz)
+        if mgmt in ("1", "0"):
+            clauses.append("manage_type = ?")
+            args.append("重点管理" if mgmt == "1" else "简化管理")
+        where = " AND ".join(clauses)
+        base = (
+            "SELECT dataid,company_name,license_no,province,city,industry,"
+            "manage_type,valid_period,issue_date FROM licenses WHERE " + where
+        )
+        try:
+            conn = sqlite3.connect(LICENSE_DB, timeout=3)
+            conn.execute("PRAGMA busy_timeout=3000")
+            total = conn.execute(
+                "SELECT COUNT(*) FROM (" + base + ")", args
+            ).fetchone()[0]
+            if total == 0:
+                conn.close()
+                return None
+            # 请求的页超出本地已建覆盖范围 → 回源上游（结果更全，避免截断假分页）
+            if off >= total:
+                conn.close()
+                return None
+            rows = conn.execute(
+                base + " ORDER BY company_name LIMIT ? OFFSET ?",
+                args + [size, off],
+            ).fetchall()
+            conn.close()
+        except sqlite3.OperationalError:
+            # 建库进程持写锁等：安全回源
+            return None
+        items = [
+            {
+                "province": r[3], "city": r[4], "license_no": r[2],
+                "company_name": r[1], "industry": r[5], "valid_period": r[7],
+                "issue_date": r[8], "manage_type": r[6], "dataid": r[0],
+            }
+            for r in rows
+        ]
+        return {
+            "total_pages": (total + size - 1) // size,
+            "count": len(items),
+            "items": items,
+            "source": "local_db",
+        }
 
-        key = self.get_temp_report_key()
-        for p in range(1, page + 1):
+    def _write_through(self, html: str, filters: dict) -> None:
+        """上游回源拿到的页写透到本地库：深页回源一次后，后续直接走本地索引。
+
+        建库进程（build_license_db.py）也在并发写同一库，此处用 INSERT OR REPLACE +
+        busy_timeout 容错，写锁冲突时静默放弃（非致命）。
+        """
+        try:
+            rows = parse_license_list(html).get("items") or []
+            if not rows:
+                return
+            conn = sqlite3.connect(LICENSE_DB, timeout=3)
+            conn.execute("PRAGMA busy_timeout=3000")
+            data = [
+                (r["dataid"], r["company_name"], r["license_no"], r["province"],
+                 r["city"], r["industry"], r["manage_type"], r["valid_period"],
+                 r["issue_date"])
+                for r in rows
+            ]
+            conn.executemany(
+                "INSERT OR REPLACE INTO licenses "
+                "(dataid,company_name,license_no,province,city,industry,"
+                "manage_type,valid_period,issue_date) VALUES (?,?,?,?,?,?,?,?,?)",
+                data,
+            )
+            conn.commit()
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _chain_fetch(self, filters: dict, page: int):
+        """上游链式翻页：同关键词顺次翻页时复用上一页 tempReportKey，仅发 1 个 POST。
+
+        深页（如第 13 页）不再从首页重走 13 次——这是此前 50s 超时的根因。
+        跳页或换关键词时回退到从首页链式重走的保底逻辑。
+        """
+        url = config.URL_LICENSE_LIST
+        if (self._chain and self._chain.get("filters") == filters
+                and page == self._chain.get("page", 0) + 1):
+            data = dict(filters)
+            data["page.pageNo"] = page
+            data["tempReportKey"] = self._chain["key"]
+            html = self.post(url, data=data, use_cache=False)
+            key = self._extract_key(html)
+            self._chain = {"filters": dict(filters), "page": page, "key": key}
+            return html, key
+        # 冷启动 / 跳页 / 本地索引断档：从「已缓存最深页」续链而非从首页重走，
+        # 避免深页（如第 13 页）重走 1..N 次触发 ~50s 超时。缓存页 HTML 内已含下一页 tempReportKey，可直接续翻。
+        start = 1
+        key = None
+        cached_html = None
+        if self.page_cache:
+            for p in range(page, 0, -1):
+                cp = dict(filters)
+                cp["page.pageNo"] = p
+                cached = self.page_cache.get(url, cp)
+                if cached is not None:
+                    start = p + 1
+                    key = self._extract_key(cached)
+                    cached_html = cached
+                    break
+        if key is None:
+            key = self.get_temp_report_key()
+        html = cached_html  # 若下面循环为空（精确页已缓存），直接返回缓存页，避免 UnboundLocalError
+        for p in range(start, page + 1):
             data = dict(filters)
             data["page.pageNo"] = p
             data["tempReportKey"] = key
-            html = self.post(config.URL_LICENSE_LIST, data=data, use_cache=False)
-            m = re.search(r'name="tempReportKey"\s+value="([^"]+)"', html)
-            key = m.group(1) if m else key
+            html = self.post(url, data=data, use_cache=False)
+            key = self._extract_key(html)
+            # 边翻边写透翻页缓存，缩短后续回源链
+            if self.page_cache:
+                self.page_cache.set(url, {"page.pageNo": p, **filters}, html, ttl=config.PAGE_CACHE_TTL)
+        self._chain = {"filters": dict(filters), "page": page, "key": key}
+        return html, key
+
+    def search_licenses_paged(self, filters: dict, page: int):
+        """分页查询许可证列表，返回 (payload, 下一页 tempReportKey, 来源)。
+
+        来源优先级：local_db（命中本地索引）> cache（翻页磁盘缓存）> upstream（回源上游）。
+        payload 在 local_db 时为已解析 dict，其余为上游 HTML 字符串。
+        """
+        url = config.URL_LICENSE_LIST
+        cache_params = dict(filters)
+        cache_params["page.pageNo"] = page
+
+        # 1) 本地索引优先（深翻页根治路径）
+        local = self._search_local(filters, page)
+        if local is not None:
+            return local, "", "local_db"
+
+        # 2) 翻页磁盘缓存
         if self.page_cache:
-            self.page_cache.set(config.URL_LICENSE_LIST, cache_params, html)
-        return html, key, False
+            cached = self.page_cache.get(url, cache_params)
+            if cached is not None:
+                return cached, "", "cache"
+
+        # 3) 回源上游（增量链式，避免深页重走）
+        html, key = self._chain_fetch(filters, page)
+        self._write_through(html, filters)
+        if self.page_cache:
+            self.page_cache.set(url, cache_params, html, ttl=config.PAGE_CACHE_TTL)
+        return html, key, "upstream"
 
     def download(self, url: str, params: dict | None = None) -> bytes:
         """下载二进制文件（不缓存）。"""
