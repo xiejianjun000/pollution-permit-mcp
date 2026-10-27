@@ -154,33 +154,72 @@ def decrypt_point_data(html: str) -> list[dict]:
 
 # ---------- 证后管理（执行报告/监督执法/自行监测） ----------
 def parse_post_permit_status(html: str) -> dict:
+    """解析 zxbg 三合一页（执行报告 + 监督执法 + 自行监测标题）。
+
+    ⚠️ 页面把三块塞进一个「合并壳表」(table#0)，其表头同时含
+       [报告类型, 报告期, 执行报告] 与 [核查日期, 是否超许可浓度限值, ...]，
+       若按子串匹配会错列。必须用「精确表头签名 + 排除跨段列」定位真实表：
+       - 执行报告表：表头含 报告类型/报告期/执行报告，且【不含】核查日期
+       - 监督执法表：表头含 核查日期/是否超许可浓度限值，且【不含】执行报告
+       无记录的企业这两张真实表只有表头行、无数据行 → 返回空列表（属正常）。
+    """
     soup = BeautifulSoup(html, "html.parser")
     text = _strip_html(html)
 
-    def section_rows(keyword: str) -> list[dict]:
-        rows = []
-        for table in soup.find_all("table"):
-            header = [th.get_text(strip=True) for th in table.find_all("th")]
-            if not header or keyword not in "|".join(header):
+    def find_table(required: list[str], exclude: tuple[str, ...] = ()) -> object | None:
+        for t in soup.find_all("table"):
+            header = [th.get_text(strip=True) for th in t.find_all("th")]
+            if not header:
                 continue
-            for tr in table.find_all("tr")[1:]:
-                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if tds:
-                    rows.append(dict(zip(header, tds)))
-            break
-        return rows
+            hj = "|".join(header)
+            if all(k in hj for k in required) and not any(k in hj for k in exclude):
+                return t
+        return None
+
+    # 执行报告表
+    er_table = find_table(["报告类型", "报告期", "执行报告"], exclude=("核查日期",))
+    er_header = ["报告类型", "报告期", "执行报告"]
+    execution_reports = []
+    if er_table:
+        for tr in er_table.find_all("tr"):
+            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            if not tds:
+                continue
+            if tds[:len(er_header)] == er_header:  # 跳过表头行本身
+                continue
+            execution_reports.append(dict(zip(er_header, tds)))
+
+    # 监督执法表（含「详情查看」pkid）
+    sup_table = find_table(["核查日期", "是否超许可浓度限值"], exclude=("执行报告",))
+    sup_header = ["核查日期", "是否超许可浓度限值", "是否落实自行监测要求",
+                  "处罚情况", "详情查看"]
+    supervision = []
+    if sup_table:
+        for tr in sup_table.find_all("tr"):
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+            vals = [td.get_text(" ", strip=True) for td in tds]
+            if not any(v.strip() for v in vals):  # 空行（仅表头/占位）
+                continue
+            row = dict(zip(sup_header, vals))
+            a = tr.find("a", href=True)
+            if a and "showSupervision" in (a.get("href") or ""):
+                pk = re.search(r"showSupervision\((?:\"|')?([0-9a-zA-Z]+)",
+                               a.get("href") or a.get("onclick") or "")
+                if pk:
+                    row["detail_pkid"] = pk.group(1)
+            supervision.append(row)
 
     result = {
-        "execution_reports": section_rows("报告类型"),
-        "supervision": section_rows("核查日期"),
+        "execution_reports": execution_reports,
+        "supervision": supervision,
+        "monitoring_url": None,  # 自行监测 iframe 在主页 getxxgkContent，不在本页
         "monitoring_note": "",
     }
-    # 自行监测信息：详情页嵌入 wryjc 平台 iframe
-    m = re.search(r'<iframe[^>]+src="(https://wryjc\.mee\.gov\.cn[^"]+)"', html)
-    if m:
-        result["monitoring_url"] = m.group(1)
     if "自行监测信息" in text:
-        result["monitoring_note"] = "自行监测信息由全国污染源监测信息管理共享平台提供（wryjc.mee.gov.cn）"
+        result["monitoring_note"] = ("自行监测信息由全国污染源监测信息管理共享平台提供"
+                                     "（wryjc.mee.gov.cn）")
     return result
 
 

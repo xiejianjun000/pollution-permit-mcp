@@ -1,5 +1,10 @@
 """平台常量与接口地址配置（基于真实站点穿透分析）。"""
 
+import os
+
+# 项目根目录（config.py 的上级目录）：翻页缓存目录基于此定位，本机/云端通用。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 BASE_URL = "https://permit.mee.gov.cn"
 
 # 公开端核心接口
@@ -31,6 +36,9 @@ URL_QRCODE = BASE_URL + "/2dcode"
 
 # 自行监测平台（详情页 iframe 对接）
 URL_MONITOR_PLATFORM = "https://wryjc.mee.gov.cn/gkpt"
+
+# 监督执法信息明细（证后管理「详情查看」弹窗）
+URL_SUPERVISION_DETAIL = BASE_URL + "/perxxgkinfo/syssb/wysb/hpsp/hpsp-company-sewage!showSupervision.action"
 
 # AES 解密参数（详情页内联 JS 硬编码）
 AES_PWD_RE = r"var pwd = '([0-9a-fA-F]+)'"
@@ -66,10 +74,20 @@ RETRY_BACKOFF = 2.0         # 重试退避基数（秒）
 # 列表页偶发超过 20s，导致正常请求被误判为失败。放宽到 45s。
 # 注意：超时与"平台拦截"是两回事，超时时应重试或稍后再试，不要当作 IP 被封。
 TIMEOUT = 45                # 单请求超时
+TOTAL_TIMEOUT = float(os.environ.get("ECO_PERMIT_TOTAL_TIMEOUT", "60"))
+PROFILE_BUILD_TIMEOUT = float(os.environ.get("ECO_PROFILE_BUILD_TIMEOUT", "240"))
+# 许可证画像整体构建预算（含下载+pdftoppm+RapidOCR），超时降级返回而非占死线程
+MAX_RESPONSE_BYTES = int(os.environ.get("ECO_PERMIT_MAX_BYTES", str(20 * 1024 * 1024)))
+# 单响应体上限：平台异常页/越界分页可能吐出几十 MB HTML，直接中止而不是慢慢收完
+# 整次请求的总耗时预算（2026-09-28 深度测试修复）。单请求超时 TIMEOUT 会在
+# 命中风控/超时时按指数退避重试 RETRY_TIMES 次，实测 page=999999 这类越界分页
+# 会累积到 549 秒才返回，把 MCP 工作线程完全占死。加了总预算后单次调用
+# 最坏 ~TOTAL_TIMEOUT 秒必返回。
 CACHE_TTL = 3600            # 缓存默认有效期（秒），1 小时
 CACHE_DB = "permit_cache.db"
 # 翻页结果磁盘缓存目录：按 (url+params) hash 存 JSON 文件，TTL 复用 CACHE_TTL
-PAGE_CACHE_DIR = "/opt/pollution-permit-mcp/work/cache"
+# 支持环境变量覆盖；默认项目内 work/cache（本机/云端通用，避免硬编码 /opt 路径）
+PAGE_CACHE_DIR = os.environ.get("POLLUTION_PERMIT_CACHE_DIR", os.path.join(_BASE_DIR, "work", "cache"))
 # 翻页磁盘缓存有效期：7 天。深翻页预热一次后长期命中，避免期满回源 50s 超时。
 PAGE_CACHE_TTL = 7 * 24 * 3600
 # 命中反爬页/超时后的指数退避基数：第 n 次重试等待 2^n * RISK_RETRY_BACKOFF 秒
