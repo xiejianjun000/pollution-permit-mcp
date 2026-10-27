@@ -84,17 +84,15 @@ def _p0a1_install_error_guard(mcp):
     _orig = tm.call_tool
 
     async def _guarded(*args, **kwargs):
+        # 只做分类日志，不再包装返回值：fastmcp 2.14 server 层对返回值
+        # 调用 .to_mcp_result()，包装成 CallToolResult/dict 都会二次报错；
+        # 异常直接 re-raise，由 fastmcp 统一转 isError 结果。
         try:
             return await _orig(*args, **kwargs)
         except Exception as _e:
             code, message, detail = _p0a1_classify(_e)
-            payload = {"code": code, "message": message}
-            if detail is not None:
-                payload["detail"] = detail
-            text = _p0a1_json.dumps(payload, ensure_ascii=False)
-            if _p0a1_CTR is not None and _p0a1_TC is not None:
-                return _p0a1_CTR(isError=True, content=[_p0a1_TC(type="text", text=text)])
-            return {"isError": True, "content": [{"type": "text", "text": text}]}
+            print(f"[permit-mcp] tool error {code}: {message}", flush=True)
+            raise
 
     try:
         tm.call_tool = _guarded
@@ -120,6 +118,7 @@ def create_server() -> FastMCP:
             "③ 执法检查与案件办理 —— 那是『执法一体化』(eco-zfyth) 的职责。\n"
             "【重要】本工具名一律 permit_pub_ 前缀。若调用返回『平台拦截/风控』报错，"
             "说明出口 IP 被封，不是查无此企业，须换本机出口重试，切勿据此断言企业未持证。"
+            "【找周边企业/附近排污单位/某区域有哪些排污企业】→ **优先用 permit_pub_nearby_enterprises**（按行政区划或关键字拉持证清单，可加中心点+半径过滤）。地图 POI（高德/天地图）只给工商点位，没有持证状态、许可证编号、行业类别与重点/简化管理类别，执法与溯源场景不得以 POI 代替本工具的持证清单。"
         ),
     )
     register_tools(mcp)
