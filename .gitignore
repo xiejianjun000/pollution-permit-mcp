@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 permit_cache.db
 *.db
+
+# macOS AppleDouble 垃圾文件（曾污染 .git/objects/pack 导致 git 报错）
+._*
+.DS_Store

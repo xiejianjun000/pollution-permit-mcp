@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -20,12 +21,103 @@ from .parser import parse_license_list
 LICENSE_DB = "/opt/pollution-permit-mcp/work/licenses.db"
 
 
+# ---- 强制 IPv4（2026-10-27）----
+# 实测根因：permit.mee.gov.cn 同时解析出 IPv6（2408:8606:...）与 IPv4
+# （114.251.10.126 等）。urllib3 默认 allowed_gai_family() 返回 AF_UNSPEC(0)，
+# 会先尝试 IPv6；而腾讯云主机没有 IPv6 出口 → 连接在内核层挂死直到 timeout。
+# 对照实测（同一 URL、同一出口）：未修 45.44s（探针 timeout 触发），
+# 强制 IPv4 后 0.39s 返回 136KB —— 116 倍差距。这就是 8018「假活」的根因，
+# 此前被误判为「上游风控 / 网络故障」。
+# 处置：把 urllib3 的地址族解析收口为 AF_INET，并在 socket 层兜底。
+import socket as _socket
+
+try:  # urllib3 1.x / 2.x 路径略有差异，两处都兜住
+    import urllib3.util.connection as _u3conn
+
+    if getattr(_u3conn, "allowed_gai_family", None) is not None:
+        _u3conn.allowed_gai_family = lambda: _socket.AF_INET
+except Exception:  # noqa: BLE001  # pragma: no cover
+    pass
+
+# 进程级兜底：socket.getaddrinfo 在 AF_UNSPEC 下仍可能返回 IPv6，
+# 这里对「没有 IPv6 出口」的主机强制剔除 IPv6 结果。
+_orig_getaddrinfo = _socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    res = _orig_getaddrinfo(host, port, family, type, proto, flags)
+    if family == _socket.AF_UNSPEC:
+        v4 = [r for r in res if r[0] == _socket.AF_INET]
+        if v4:
+            return v4
+    return res
+
+
+_socket.getaddrinfo = _ipv4_only_getaddrinfo
+
+
+# ---- 全局风控熔断（2026-10-19）----
+# 命中风控页/超时耗尽重试后，全局冷却一段时间：期间所有需回源的请求快速失败，
+# 避免每调用各自重试硬扛（3次×退避+45s）继续刺激已敏感的上游。
+# 缓存命中不受熔断影响（缓存检查在熔断检查之前）。
+RISK_COOLDOWN_SEC = float(os.environ.get("ECO_PERMIT_RISK_COOLDOWN", "600"))
+_RISK_COOLDOWN = {"until": 0.0, "reason": ""}
+
+
+def risk_cooldown_state() -> dict:
+    left = _RISK_COOLDOWN["until"] - time.time()
+    return {"cooling": left > 0, "remaining_sec": max(0, int(left)),
+            "reason": _RISK_COOLDOWN["reason"][:120]}
+
+
 
 class RiskControlError(RuntimeError):
     """上游 permit.mee.gov.cn 风控/反爬拦截：命中引导页/errorinfo 或连续超时。
 
     与一般网络错误区分，供上层明确识别为『上游风控』而非静默空结果。
     """
+
+
+def resolve_region(province_cn: str = "", city_cn: str = "") -> tuple:
+    """中文省市名 -> 全国排污许可平台 12 位 regioncode（用于 province/city 参数）。
+
+    数据源 region_full.json 由平台 getRegions.action 实测抓取（2026-09-28）。
+    返回 (province_code, city_code)，找不到对应项时为空串。
+    """
+    global _REGION_TABLE
+    if _REGION_TABLE is None:
+        p = Path(__file__).resolve().parent / "region_full.json"
+        if p.exists():
+            try:
+                _REGION_TABLE = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                _REGION_TABLE = {"provinces": [], "cities_by_province_code": {}}
+        else:
+            _REGION_TABLE = {"provinces": [], "cities_by_province_code": {}}
+    p_code = ""
+    for name, code in _REGION_TABLE["provinces"]:
+        if province_cn and (name == province_cn or province_cn in name or name in province_cn):
+            p_code = code
+            break
+    c_code = ""
+    if city_cn:
+        pool = _REGION_TABLE["cities_by_province_code"].get(p_code, [])
+        for name, code in pool:
+            if name == city_cn or city_cn in name or name in city_cn:
+                c_code = code
+                break
+        if not c_code:  # 全局兜底（同名城取首个）
+            for cities in _REGION_TABLE["cities_by_province_code"].values():
+                for name, code in cities:
+                    if name == city_cn:
+                        c_code = code
+                        break
+                if c_code:
+                    break
+    return p_code, c_code
+
+
+_REGION_TABLE = None
 
 
 class Cache:
@@ -171,17 +263,55 @@ class PermitClient:
             if hit is not None:
                 return hit
 
+        # 熔断检查：冷却期内需回源的请求快速失败（缓存命中已在上面放行）
+        _left_cd = _RISK_COOLDOWN["until"] - time.time()
+        if _left_cd > 0:
+            raise RiskControlError(
+                "【全局熔断】上游风控冷却中（剩余 %ds），请求未发出：%s。%s"
+                % (int(_left_cd), url, _RISK_COOLDOWN["reason"]))
+
         last_err: Optional[Exception] = None
         risk_blocked = False
+        # 总耗时预算：超过即放弃重试，避免指数退避把单次调用拖到数分钟
+        deadline = time.time() + config.TOTAL_TIMEOUT
         for attempt in range(config.RETRY_TIMES):
+            _left = deadline - time.time()
+            if _left <= 0:
+                raise RuntimeError(
+                    "请求总预算 %.0fs 耗尽（第 %d 次尝试前中止）：%s"
+                    % (config.TOTAL_TIMEOUT, attempt + 1, url))
             try:
                 self._throttle()
-                resp = self.session.request(
-                    method, url, params=params, data=data, timeout=config.TIMEOUT
-                )
-                resp.raise_for_status()
-                resp.encoding = resp.apparent_encoding or resp.encoding
-                text = resp.text
+                # 流式读取 + 读过程卡 deadline：requests 的 timeout 只约束单次
+                # socket 等待，慢速传输（每几十秒来一字节）永远不会触发，
+                # 实测 page=999999 把单次调用拖到 584 秒。这里按「已用总时长」强制中断。
+                with self.session.request(
+                        method, url, params=params, data=data,
+                        timeout=min(config.TIMEOUT, max(1.0, _left)),
+                        stream=True) as resp:
+                    resp.raise_for_status()
+                    chunks = []
+                    for _c in resp.iter_content(65536):
+                        if time.time() > deadline:
+                            raise requests.Timeout(
+                                "响应读取超出总预算 %.0fs：%s"
+                                % (config.TOTAL_TIMEOUT, url))
+                        chunks.append(_c)
+                    raw = b"".join(chunks)
+                    # 2026-09-28 修复：resp.apparent_encoding 在 iter_content 之后访问
+                    # 已流式消费的 body，会抛 "The content for this response was already consumed"，
+                    # 导致所有上游回源（含 get_temp_report_key）静默失败。
+                    # 改为：优先响应头 charset；无则从 raw 前 2KB 探测 <meta charset>；最后 utf-8。
+                    enc = resp.encoding or ""
+                    if not enc or enc.lower() in ("iso-8859-1", "latin-1", "ascii"):
+                        _m = re.search(rb'charset=["\']?([a-zA-Z0-9_-]+)', raw[:2000])
+                        enc = _m.group(1).decode("ascii", "ignore") if _m else "utf-8"
+                    text = raw.decode(enc, "replace")
+                    if len(raw) > config.MAX_RESPONSE_BYTES:
+                        # 异常巨大的响应通常是平台异常页，不必继续解析
+                        raise requests.Timeout(
+                            "响应体 %.1fMB 超过上限 %d 字节：%s"
+                            % (len(raw) / 1048576, config.MAX_RESPONSE_BYTES, url))
                 # 反爬错误页检测：平台对异常出口（云主机 IP / 缺 Referer）返回
                 # errorinfo.jsp，HTTP 仍是 200。不拦截会被解析成 count=0 的空结果，
                 # 让调用方误判为"查无数据"。此处显式抛错，且绝不写入缓存。
@@ -201,6 +331,9 @@ class PermitClient:
                 time.sleep(config.RISK_RETRY_BACKOFF * (2 ** attempt))
 
         if risk_blocked:
+            # 触发全局熔断：所有回源请求冷却 RISK_COOLDOWN_SEC 秒
+            _RISK_COOLDOWN["until"] = time.time() + RISK_COOLDOWN_SEC
+            _RISK_COOLDOWN["reason"] = str(last_err)[:200]
             raise RiskControlError(
                 f"【上游风控】permit.mee.gov.cn 连续 {config.RETRY_TIMES} 次返回反爬页或超时，"
                 f"已按 2^n×{config.RISK_RETRY_BACKOFF}s 指数退避重试仍失败：{url}。"
